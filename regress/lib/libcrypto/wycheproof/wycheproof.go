@@ -1,4 +1,4 @@
-/* $OpenBSD: wycheproof.go,v 1.161 2024/11/24 10:13:16 tb Exp $ */
+/* $OpenBSD: wycheproof.go,v 1.167 2025/09/04 16:53:06 tb Exp $ */
 /*
  * Copyright (c) 2018,2023 Joel Sing <jsing@openbsd.org>
  * Copyright (c) 2018,2019,2022-2024 Theo Buehler <tb@openbsd.org>
@@ -578,6 +578,13 @@ type wycheproofTestGroupRunner interface {
 	run(string, testVariant) bool
 }
 
+type wycheproofVersion int
+
+const (
+	v0 wycheproofVersion = iota
+	v1
+)
+
 type wycheproofTestVectors struct {
 	Algorithm        string            `json:"algorithm"`
 	GeneratorVersion string            `json:"generatorVersion"`
@@ -585,6 +592,15 @@ type wycheproofTestVectors struct {
 	NumberOfTests    int               `json:"numberOfTests"`
 	// Header
 	TestGroups []json.RawMessage `json:"testGroups"`
+}
+
+type wycheproofTestVectorsV1 struct {
+	Algorithm     string            `json:"algorithm"`
+	Schema        string            `json:"schema"`
+	NumberOfTests int               `json:"numberOfTests"`
+	Header        []string          `json:"header"`
+	Notes         json.RawMessage   `json:"notes"`
+	TestGroups    []json.RawMessage `json:"testGroups"`
 }
 
 var nids = map[string]int{
@@ -2623,7 +2639,7 @@ func testGroupFromAlgorithm(algorithm string, variant testVariant) wycheproofTes
 		return &wycheproofTestGroupEdDSA{}
 	case "HKDF-SHA-1", "HKDF-SHA-256", "HKDF-SHA-384", "HKDF-SHA-512":
 		return &wycheproofTestGroupHkdf{}
-	case "HMACSHA1", "HMACSHA224", "HMACSHA256", "HMACSHA384", "HMACSHA512", "HMACSHA3-224", "HMACSHA3-256", "HMACSHA3-384", "HMACSHA3-512":
+	case "HMACSHA1", "HMACSHA224", "HMACSHA256", "HMACSHA384", "HMACSHA512", "HMACSHA512/224", "HMACSHA512/256", "HMACSHA3-224", "HMACSHA3-256", "HMACSHA3-384", "HMACSHA3-512":
 		return &wycheproofTestGroupHmac{}
 	case "KW":
 		return &wycheproofTestGroupKW{}
@@ -2644,32 +2660,46 @@ func testGroupFromAlgorithm(algorithm string, variant testVariant) wycheproofTes
 	}
 }
 
-func runTestVectors(path string, variant testVariant) bool {
+func runTestVectors(path string, variant testVariant, version wycheproofVersion) bool {
+	var algorithm string
+	var testGroups []json.RawMessage
 	b, err := ioutil.ReadFile(path)
 	if err != nil {
 		log.Fatalf("Failed to read test vectors: %v", err)
 	}
-	wtv := &wycheproofTestVectors{}
-	if err := json.Unmarshal(b, wtv); err != nil {
-		log.Fatalf("Failed to unmarshal JSON: %v", err)
+	if version == v0 {
+		wtv := &wycheproofTestVectors{}
+		if err := json.Unmarshal(b, wtv); err != nil {
+			log.Fatalf("Failed to unmarshal JSON: %v", err)
+		}
+		algorithm = wtv.Algorithm
+		testGroups = wtv.TestGroups
+		fmt.Printf("Loaded Wycheproof test vectors for %v with %d tests from %q\n", wtv.Algorithm, wtv.NumberOfTests, filepath.Base(path))
+	} else {
+		wtv := &wycheproofTestVectorsV1{}
+		if err := json.Unmarshal(b, wtv); err != nil {
+			log.Fatalf("Failed to unmarshal JSON: %v", err)
+		}
+		algorithm = wtv.Algorithm
+		testGroups = wtv.TestGroups
+		fmt.Printf("Loaded Wycheproof v1 test vectors for %v with %d tests from %q\n", wtv.Algorithm, wtv.NumberOfTests, filepath.Base(path))
 	}
-	fmt.Printf("Loaded Wycheproof test vectors for %v with %d tests from %q\n", wtv.Algorithm, wtv.NumberOfTests, filepath.Base(path))
 
 	success := true
-	for _, tg := range wtv.TestGroups {
-		wtg := testGroupFromAlgorithm(wtv.Algorithm, variant)
+	for _, tg := range testGroups {
+		wtg := testGroupFromAlgorithm(algorithm, variant)
 		if wtg == nil {
-			log.Printf("INFO: Unknown test vector algorithm %q", wtv.Algorithm)
+			log.Printf("INFO: Unknown test vector algorithm %q", algorithm)
 			return false
 		}
 		if err := json.Unmarshal(tg, wtg); err != nil {
 			log.Fatalf("Failed to unmarshal test groups JSON: %v", err)
 		}
 		testc.runTest(func() bool {
-			return wtg.run(wtv.Algorithm, variant)
+			return wtg.run(algorithm, variant)
 		})
 	}
-	for _ = range wtv.TestGroups {
+	for _ = range testGroups {
 		result := <-testc.resultCh
 		if !result {
 			success = false
@@ -2721,35 +2751,36 @@ func main() {
 	}
 
 	tests := []struct {
+		version wycheproofVersion
 		name    string
 		pattern string
 		variant testVariant
 	}{
-		{"AES", "aes_[cg]*[^xv]_test.json", Normal}, // Skip AES-EAX, AES-GCM-SIV and AES-SIV-CMAC.
-		{"ChaCha20-Poly1305", "chacha20_poly1305_test.json", Normal},
-		{"DSA", "dsa_*test.json", Normal},
-		{"DSA", "dsa_*_p1363_test.json", P1363},
-		{"ECDH", "ecdh_test.json", Normal},
-		{"ECDH", "ecdh_[^w_]*_test.json", Normal},
-		{"ECDH EcPoint", "ecdh_*_ecpoint_test.json", EcPoint},
-		{"ECDH webcrypto", "ecdh_webcrypto_test.json", Webcrypto},
-		{"ECDSA", "ecdsa_test.json", Normal},
-		{"ECDSA", "ecdsa_[^w]*test.json", Normal},
-		{"ECDSA P1363", "ecdsa_*_p1363_test.json", P1363},
-		{"ECDSA webcrypto", "ecdsa_webcrypto_test.json", Webcrypto},
-		{"EDDSA", "eddsa_test.json", Normal},
-		{"ED448", "ed448_test.json", Skip},
-		{"HKDF", "hkdf_sha*_test.json", Normal},
-		{"HMAC", "hmac_sha*_test.json", Normal},
-		{"JSON webcrypto", "json_web_*_test.json", Skip},
-		{"KW", "kw_test.json", Normal},
-		{"Primality test", "primality_test.json", Normal},
-		{"RSA", "rsa_*test.json", Normal},
-		{"X25519", "x25519_test.json", Normal},
-		{"X25519 ASN", "x25519_asn_test.json", Skip},
-		{"X25519 JWK", "x25519_jwk_test.json", Skip},
-		{"X25519 PEM", "x25519_pem_test.json", Skip},
-		{"XCHACHA20-POLY1305", "xchacha20_poly1305_test.json", Normal},
+		{v0, "AES", "aes_[cg]*[^xv]_test.json", Normal}, // Skip AES-EAX, AES-GCM-SIV and AES-SIV-CMAC.
+		{v1, "ChaCha20-Poly1305", "chacha20_poly1305_test.json", Normal},
+		{v0, "DSA", "dsa_*test.json", Normal},
+		{v0, "DSA", "dsa_*_p1363_test.json", P1363},
+		{v0, "ECDH", "ecdh_test.json", Normal},
+		{v0, "ECDH", "ecdh_[^w_]*_test.json", Normal},
+		{v0, "ECDH EcPoint", "ecdh_*_ecpoint_test.json", EcPoint},
+		{v0, "ECDH webcrypto", "ecdh_webcrypto_test.json", Webcrypto},
+		{v0, "ECDSA", "ecdsa_test.json", Normal},
+		{v0, "ECDSA", "ecdsa_[^w]*test.json", Normal},
+		{v0, "ECDSA P1363", "ecdsa_*_p1363_test.json", P1363},
+		{v0, "ECDSA webcrypto", "ecdsa_webcrypto_test.json", Webcrypto},
+		{v0, "EDDSA", "eddsa_test.json", Normal},
+		{v0, "ED448", "ed448_test.json", Skip},
+		{v0, "HKDF", "hkdf_sha*_test.json", Normal},
+		{v1, "HMAC", "hmac_sha*_test.json", Normal},
+		{v0, "JSON webcrypto", "json_web_*_test.json", Skip},
+		{v0, "KW", "kw_test.json", Normal},
+		{v0, "Primality test", "primality_test.json", Normal},
+		{v0, "RSA", "rsa_*test.json", Normal},
+		{v0, "X25519", "x25519_test.json", Normal},
+		{v0, "X25519 ASN", "x25519_asn_test.json", Skip},
+		{v0, "X25519 JWK", "x25519_jwk_test.json", Skip},
+		{v0, "X25519 PEM", "x25519_pem_test.json", Skip},
+		{v1, "XCHACHA20-POLY1305", "xchacha20_poly1305_test.json", Normal},
 	}
 
 	success := true
@@ -2767,29 +2798,33 @@ func main() {
 	skipNormal := regexp.MustCompile(`_(ecpoint|p1363|sect\d{3}[rk]1|secp(160|192))_`)
 
 	for _, test := range tests {
-		tvs, err := filepath.Glob(filepath.Join(testVectorPath, test.pattern))
+		path := testVectorPath
+		if test.version == v1 {
+			path = path + "_v1"
+		}
+		tvs, err := filepath.Glob(filepath.Join(path, test.pattern))
 		if err != nil {
 			log.Fatalf("Failed to glob %v test vectors: %v", test.name, err)
 		}
 		if len(tvs) == 0 {
-			log.Fatalf("Failed to find %v test vectors at %q\n", test.name, testVectorPath)
+			log.Fatalf("Failed to find %v test vectors at %q\n", test.name, path)
 		}
 		for _, tv := range tvs {
 			if test.variant == Skip || (test.variant == Normal && skipNormal.Match([]byte(tv))) {
-				fmt.Printf("INFO: Skipping tests from \"%s\"\n", strings.TrimPrefix(tv, testVectorPath+"/"))
+				fmt.Printf("INFO: Skipping tests from \"%s\"\n", strings.TrimPrefix(tv, path+"/"))
 				continue
 			}
 			wg.Add(1)
 			<-vectorsRateLimitCh
-			go func(tv string, variant testVariant) {
+			go func(tv string, variant testVariant, version wycheproofVersion) {
 				select {
-				case resultCh <- runTestVectors(tv, variant):
+				case resultCh <- runTestVectors(tv, variant, version):
 				default:
 					log.Fatal("result channel is full")
 				}
 				vectorsRateLimitCh <- true
 				wg.Done()
-			}(tv, test.variant)
+			}(tv, test.variant, test.version)
 		}
 	}
 
